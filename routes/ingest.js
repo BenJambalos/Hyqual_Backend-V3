@@ -218,9 +218,20 @@ router.post('/ingest/readings', async (req, res) => {
   }
 
   // ---- when was it taken? ----
-  const when = parseRecordedAt(body.recordedAt);
-  if (!when.ok) {
-    return res.status(422).json({ error: 'recordedAt is not a valid recent time (device clock not synced?)', code: 'BAD_TIMESTAMP' });
+  // `recordedAt` is the documented field and is validated strictly (422 when
+  // wrong). The ESP32 firmware in /esp32 sends the same moment as `createdAt`
+  // (ISO-8601 UTC); it is used as a fallback, but leniently: an unusable
+  // `createdAt` just means "treat as a live reading" and never rejects the
+  // reading, so a device with a bad clock can't get its whole queue stuck.
+  let when;
+  if (body.recordedAt !== undefined && body.recordedAt !== null && body.recordedAt !== '') {
+    when = parseRecordedAt(body.recordedAt);
+    if (!when.ok) {
+      return res.status(422).json({ error: 'recordedAt is not a valid recent time (device clock not synced?)', code: 'BAD_TIMESTAMP' });
+    }
+  } else {
+    when = parseRecordedAt(body.createdAt);
+    if (!when.ok) when = { ok: true, epoch: null };
   }
 
   // ---- the measurements ----
@@ -269,7 +280,12 @@ router.post('/ingest/readings', async (req, res) => {
     );
 
     const isFresh = when.epoch === null || (Date.now() / 1000 - when.epoch) <= ALERT_FRESH_SECONDS;
-    if (isFresh) {
+    // Alerts describe what a device is monitoring NOW. A reading that belongs
+    // to a pond the device has since been moved out of is history (it is
+    // stored, but it must not open an alert - or sound the alarm - for a pond
+    // that no longer has this device).
+    const forCurrentPond = pondId === device.pond_id;
+    if (isFresh && forCurrentPond) {
       const [thRows] = await conn.query('SELECT parameter, min_value, max_value FROM parameter_thresholds WHERE farm_id = ?', [device.farm_id]);
       const thresholds = {};
       for (const r of thRows) thresholds[r.parameter] = { min: r.min_value, max: r.max_value };

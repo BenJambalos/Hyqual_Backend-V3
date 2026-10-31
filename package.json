@@ -1,5 +1,5 @@
 {
-  "name": "hyquai_backend",
+  "name": "hyqual_backend",
   "version": "1.0.0",
   "description": "HyQual REST API - Node.js + Express + MySQL",
   "main": "server.js",

@@ -5,9 +5,11 @@ const cors = require('cors');
 const authRoutes = require('./routes/auth');
 const profileRoutes = require('./routes/profile');
 const pondsRoutes = require('./routes/ponds');
+const riskRoutes = require('./routes/risk');
 const devicesRoutes = require('./routes/devices');
 const ingestRoutes = require('./routes/ingest');
 const notificationsRoutes = require('./routes/notifications');
+const alarmsRoutes = require('./routes/alarms');
 const reportsRoutes = require('./routes/reports');
 const adminRoutes = require('./routes/admin');
 const pool = require('./db');
@@ -42,8 +44,10 @@ app.use('/api', ingestRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api', profileRoutes);
 app.use('/api', pondsRoutes);
+app.use('/api', riskRoutes);
 app.use('/api', devicesRoutes);
 app.use('/api', notificationsRoutes);
+app.use('/api', alarmsRoutes);
 app.use('/api', reportsRoutes);
 
 // Express 5 forwards thrown/rejected errors from async handlers here

@@ -44,7 +44,7 @@ function explain(err) {
     ETIMEDOUT: 'Connection timed out. Wrong host/port, a firewall/VPN/school Wi-Fi blocking the port, or the MySQL service is not running (check Railway > MySQL > Deployments).',
     ER_ACCESS_DENIED_ERROR: 'Wrong user or password. Copy MYSQL_PUBLIC_URL again from Railway > MySQL > Variables (the password is part of it).',
     ER_BAD_DB_ERROR: 'That database name does not exist. On Railway it is normally "railway" (the last part of the URL).',
-    ER_NOT_SUPPORTED_AUTH_MODE: 'Auth plugin problem. Make sure you ran `npm install` inside hyquai_backend so mysql2 is up to date.',
+    ER_NOT_SUPPORTED_AUTH_MODE: 'Auth plugin problem. Make sure you ran `npm install` inside hyqual_backend so mysql2 is up to date.',
   };
   return hints[err.code] || '';
 }

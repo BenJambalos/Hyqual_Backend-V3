@@ -14,11 +14,11 @@ You need MySQL or MariaDB running. Then:
 
 ```bash
 mysql -u root -p -e "CREATE DATABASE hyquai_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-mysql -u root -p hyquai_db < database/schema.sql
-mysql -u root -p hyquai_db < database/seed_data.sql
+mysql -u root -p hyquai_db < database1/schema.sql
+mysql -u root -p hyquai_db < database1/seed_data.sql
 ```
 
-`database/schema.sql` is **your** ERD schema (from `ERD2.mwb`) with
+`database1/schema.sql` is **your** ERD schema (from `ERD2.mwb`) with
 corrections — each one is marked with a `-- CORRECTION` comment in the
 file explaining exactly what changed and why (short version: forecasts
 and notifications needed a `pond_id` since your farms have multiple
@@ -35,9 +35,12 @@ No `mysql` command line? Every `mysql ... < file.sql` above works as
 
 **Already have a database with data?** Do NOT re-run `schema.sql`. Run the
 migrations in order instead: `001_account_approval.sql`, then
-`002_device_status_and_reading_pond.sql` (see the notes at the top of each).
+`002_device_status_and_reading_pond.sql`, then
+`003_one_device_per_pond.sql` (see the notes at the top of each; each is safe
+to repeat). 003 is the one that makes moving a device between ponds instant
+and correct.
 
-`database/seed_data.sql` populates it with the same demo data the app
+`database1/seed_data.sql` populates it with the same demo data the app
 already shows: farm owner Juan Dela Cruz, 4 ponds (Normal/Warning/
 Critical/Offline), 5 devices, ~7 days of realistic readings, and 5
 notifications. Login with `farmer@hyquai.demo` / `HyQuai123!`.
@@ -98,10 +101,11 @@ node seed_generator.js
 - **Super Admin only** — `GET /api/admin/accounts/pending`, `PUT /api/admin/accounts/:accountId/approve`, `PUT /api/admin/accounts/:accountId/reject`
 - `GET/POST /api/ponds`, `PUT/DELETE /api/ponds/:id`, `GET /api/ponds/:id` (detail), `GET /api/ponds/:id/forecast`
 - `GET/POST /api/devices`, `PUT/DELETE /api/devices/:id`, `GET /api/devices/:id`, `POST /api/devices/:id/assign`
-- `PUT /api/devices/:id/pond` `{ "pond_id": 2 }` — remote reassignment from the app (pond must belong to the caller's farm)
+- `PUT /api/devices/:id/pond` `{ "pond_id": 2 }` — remote reassignment from the app (pond must belong to the caller's farm). It takes effect at once and the reply says what happened: `{ changed, device_id, pond_id, pond_name, previous_pond_id, previous_pond_name, displaced_device, pond: {status, awaitingReading…}, previous_pond: {status…}, message }`. The pond the device left is `offline` and the pond it entered is online ("waiting for first reading") in that same reply and in the very next `GET /ponds`. A pond holds ONE device: moving a device into an occupied pond unassigns the other one (`displaced_device`). `POST /devices/:id/assign`, `PUT /devices/:id {pondId}` and `POST /devices {pondId}` use the same logic (`utils/deviceAssignment.js`).
+- `GET /api/alarms` — every parameter that is CRITICAL right now in a pond whose device is online and has sent a fresh reading since it was assigned: `{ count, alarms: [{ key, pondId, pondName, parameter, label, value, unit, min, max, direction, message }] }`. The app polls it every 10 s and sounds its loud alarm while the list is not empty. Warnings, offline ponds, ponds still waiting for their first reading, and readings older than `ALARM_MAX_READING_AGE_SECONDS` (20 min) never ring.
 - `GET /api/devices/:deviceId/config` — polled by the ESP32; authenticates with header `x-device-key` (not a user JWT) and returns `{ device_id, farm_id, pond_id, pond_name }`
 - `POST /api/ingest/readings`, `POST /api/ingest/status` — called by the physical device (authenticated via `device_key`, not a user JWT). Posting a reading automatically creates or resolves alerts by comparing against `parameter_thresholds` — see `routes/ingest.js`.
-  - **Readings** `{ deviceKey, temperature, phLevel, dissolvedOxygen, salinity, pondId?, recordedAt? }`. The stored row carries the pond it was taken in (`water_quality_readings.pond_id`). A device that queued a reading on its SD card sends the `pondId` it had and the `recordedAt` time (epoch seconds or ISO) of the moment it was taken, so a later pond change can't re-label it. Without `pondId` the device's current pond is used; without `recordedAt` the server time is used. Re-sending the same `recordedAt` is answered `200 {duplicate:true}` (no second row). `422` means "will never be accepted" (unknown/deleted pond, impossible timestamp, no usable value) — the device should drop it; `409` = device has no pond and none was given. Values outside a physical range (pH 99…) are stored as NULL and listed in `ignored`. Readings older than 10 minutes are stored but raise no new alerts.
+  - **Readings** `{ deviceKey, temperature, phLevel, dissolvedOxygen, salinity, pondId?, recordedAt? }` (the firmware sends the capture time as `createdAt`; it is accepted as a lenient fallback for `recordedAt` and never causes a rejection). The stored row carries the pond it was taken in (`water_quality_readings.pond_id`). A device that queued a reading on its SD card sends the `pondId` it had and the `recordedAt` time (epoch seconds or ISO) of the moment it was taken, so a later pond change can't re-label it. Without `pondId` the device's current pond is used; without `recordedAt` the server time is used. Re-sending the same `recordedAt` is answered `200 {duplicate:true}` (no second row). `422` means "will never be accepted" (unknown/deleted pond, impossible timestamp, no usable value) — the device should drop it; `409` = device has no pond and none was given. Values outside a physical range (pH 99…) are stored as NULL and listed in `ignored`. Readings older than 10 minutes, and readings that belong to a pond the device has since been moved out of, are stored but raise no new alerts.
   - **Status** `{ deviceKey, batteryPercentage, isCharging, connectivityStatus, signalStrength, activeSensorsCount }` updates the device's ONE `device_status` row in place (never inserts a second). Both replies include `config: { pond_id, pond_name }` = the device's current pond.
   - **Online/offline** is never reported by the device. Every contact (heartbeat, reading, config poll) stamps `device_status.last_seen_at`; a device silent for `DEVICE_OFFLINE_AFTER_SECONDS` (default 180) is OFFLINE in every API response, even if the server was restarted, and a once-a-minute job raises one "Device Offline" notification per outage and resolves it when the device returns (`utils/deviceHealth.js`).
 - `GET /api/notifications` (+ `PUT .../read`, `PUT .../mark-all-read`)
@@ -128,10 +132,10 @@ them. Mapping used by the API: `pending` = PENDING, `active` = APPROVED
 (the status that already existed), `rejected` = REJECTED.
 
 **Existing database (local or Railway):** run
-`database/migrations/001_account_approval.sql` once. It only ALTERs two
+`database1/migrations/001_account_approval.sql` once. It only ALTERs two
 columns on `accounts`; existing accounts stay `active`. Check your live
 column values first (the file explains how). Fresh installs get the same
-change from `database/schema.sql`.
+change from `database1/schema.sql`.
 
 **Create the Super Admin yourself** (SQL example at the bottom of the
 migration file). It needs a bcrypt hash:
@@ -140,7 +144,7 @@ migration file). It needs a bcrypt hash:
 ## Deploying on Railway
 
 1. Railway project with a **MySQL** service and a service from this repo
-   (set the service's *Root Directory* to `hyquai_backend`; start command
+   (set the service's *Root Directory* to `hyqual_backend`; start command
    is `npm start`).
 2. On the Node service add variables: `JWT_SECRET` (long random string),
    `NODE_ENV=production`, and reference the MySQL service's `MYSQLHOST`,
@@ -159,14 +163,15 @@ migration file). It needs a bcrypt hash:
    # Windows PowerShell:   $env:DB_URL='mysql://root:PASSWORD@HOST:PORT/railway'
    # Windows CMD:          set DB_URL=mysql://root:PASSWORD@HOST:PORT/railway
 
-   node scripts/run_sql.js database/schema.sql          # NEW database
-   node scripts/run_sql.js database/seed_data.sql       # optional demo data
+   node scripts/run_sql.js database1/schema.sql          # NEW database
+   node scripts/run_sql.js database1/seed_data.sql       # optional demo data
    node scripts/create_super_admin.js you@example.com 'a-strong-password' First Last
    ```
 
    Existing Railway database with data? Take a backup, then instead of
-   `schema.sql` run `database/migrations/001_...sql` and
-   `002_...sql` the same way (each is safe to repeat).
+   `schema.sql` run `database1/migrations/001_...sql`, `002_...sql` and
+   `003_...sql` the same way (each is safe to repeat; skip the ones you
+   already ran).
 5. Check it: open `https://<domain>/api/health/db` — it must say
    `{"status":"ok","db":"ok"}`. The deploy log shows `Database connection OK`.
 6. Flutter: `flutter run --dart-define=API_BASE_URL=https://<domain>/api`
@@ -181,7 +186,7 @@ migration file). It needs a bcrypt hash:
 |---|---|
 | `scripts/run_sql.js <file.sql>` / `-e "SQL"` | Runs SQL against `DB_URL` (or `.env`); no mysql client needed |
 | `scripts/create_super_admin.js <email> <password> [First] [Last]` | Creates / resets the Super Admin login |
-| `scripts/simulate_device.js <apiBase> <id> <key> [secs]` | Pretends to be an ESP32 |
+| `scripts/simulate_device.js <apiBase> <id> <key> [secs] [critical]` | Pretends to be an ESP32. Add `critical` to send dangerously low dissolved oxygen and trigger the app's alarm |
 
 ## Tests
 
@@ -192,6 +197,8 @@ export SUPERADMIN_EMAIL=you@example.com SUPERADMIN_PASSWORD=...
 node tests/approval_flow.js    # register, pending, reject, approve, farm/pond/device setup, cross-farm protections
 node tests/device_flow.js      # one status row per device, OFFLINE detection, readings keep their pond,
                                # queued (SD-card) readings, duplicates, bad input, history after a device moves
+node tests/reassign_flow.js    # moving a device: old pond offline / new pond online at once, one device per pond,
+                               # no stale data after moving back, the critical-level alarm endpoint
 node ../esp32/host_test/firmware_e2e.js   # the real firmware logic against this API (see esp32/README.md)
 ```
 
@@ -251,3 +258,16 @@ This version implements the following behavior:
 6. Verify `GET /api/health/db`, then test: assign to Pond A, send a reading, reassign to Pond B, send another reading, and confirm the two rows have different `pond_id` values. Also confirm repeated status heartbeats still leave one row in `device_status`.
 
 Important limitation: historical readings created before `pond_id` existed cannot be perfectly attributed after a device has moved. The migration backfills them from the device's current pond because older assignment history was not stored. New readings will preserve their pond association.
+
+## Moving a device between ponds (instant) and the critical alarm
+
+**What the API now does when a device is moved from Pond A to Pond B**
+
+- Pond A has no device any more, so it is `offline` in the same reply and in the next `GET /ponds`.
+- Pond B is online straight away. Until the device has sent a reading taken after the move it shows `status: "normal"`, `updatedAgo: "waiting for first reading"`, `awaitingReading: true`. The updated ESP32 firmware sends that reading within seconds of learning about the move (config is polled every 10 s). If none arrives within `POND_FIRST_READING_GRACE_SECONDS` (default 600) the pond goes `offline` (device alive but delivering no data).
+- Only readings taken since the device entered the pond (`monitoring_devices.assigned_at`) count as the pond's current reading. Moving a device back into a pond it was in earlier does not revive that pond's old readings.
+- A pond holds at most one device (`UNIQUE(monitoring_devices.pond_id)`). Before, two devices in one pond made that pond appear twice in the list.
+
+**Where this lives:** `utils/pondState.js` (what a pond looks like, shared by `/ponds`, `/ponds/:id`, the move reply and `/alarms`), `utils/deviceAssignment.js` (the only code that changes a device's pond), `routes/alarms.js`, migration `003_one_device_per_pond.sql`.
+
+**Optional settings** (Railway Variables or `.env`): `POND_FIRST_READING_GRACE_SECONDS` (600), `ALARM_MAX_READING_AGE_SECONDS` (1200).

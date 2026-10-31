@@ -2,15 +2,20 @@
 // It does what the real firmware does: asks the API which pond it belongs
 // to, sends a status heartbeat, and uploads a reading, on a timer.
 //
-//   node scripts/simulate_device.js <API_BASE> <DEVICE_ID> <DEVICE_KEY> [seconds-between-readings]
+//   node scripts/simulate_device.js <API_BASE> <DEVICE_ID> <DEVICE_KEY> [seconds-between-readings] [critical]
 //   node scripts/simulate_device.js https://your-app.up.railway.app/api 1 dk_abc123... 10
+//   node scripts/simulate_device.js https://your-app.up.railway.app/api 1 dk_abc123... 10 critical
 //
 // Things to try while it runs:
-//   * move the device to another pond in the app  -> the log shows the new pond
+//   * move the device to another pond in the app  -> the log shows the new pond, the old
+//                                                    pond turns OFFLINE and the new one online at once
 //   * press Ctrl+C (the "power cut")              -> after ~3 minutes the app shows OFFLINE
-const [base, deviceId, deviceKey, everyArg] = process.argv.slice(2);
+//   * add the word  critical  (last argument)     -> dissolved oxygen is sent far below the safe
+//                                                    range, so the app's loud alarm goes off
+const [base, deviceId, deviceKey, everyArg, mode] = process.argv.slice(2);
+const critical = String(mode || '').toLowerCase() === 'critical';
 if (!base || !deviceId || !deviceKey) {
-  console.error('Usage: node scripts/simulate_device.js <API_BASE> <DEVICE_ID> <DEVICE_KEY> [seconds]');
+  console.error('Usage: node scripts/simulate_device.js <API_BASE> <DEVICE_ID> <DEVICE_KEY> [seconds] [critical]');
   process.exit(1);
 }
 const every = Math.max(2, Number(everyArg) || 10) * 1000;
@@ -55,8 +60,11 @@ async function tick(n) {
 
     if (!pondId) { console.log('not assigned to a pond - not recording readings'); return; }
     temp = walk(temp, 0.2, 25, 32); ph = walk(ph, 0.05, 6.8, 8.3); dox = walk(dox, 0.2, 3, 8); sal = walk(sal, 0.2, 10, 20);
+    // "critical" mode: dissolved oxygen far below the 5.0 mg/L floor.
+    if (critical) dox = walk(2.0, 0.2, 1.5, 2.5);
     const r = await call('POST', '/ingest/readings', {
-      deviceKey, pondId, temperature: +temp.toFixed(2), phLevel: +ph.toFixed(2),
+      // pondIdAtCapture is what the real firmware sends (pondId is the older name)
+      deviceKey, pondIdAtCapture: pondId, temperature: +temp.toFixed(2), phLevel: +ph.toFixed(2),
       dissolvedOxygen: +dox.toFixed(2), salinity: +sal.toFixed(2),
     });
     if (r.status === 201 || r.status === 200) {
@@ -70,7 +78,7 @@ async function tick(n) {
   }
 }
 
-console.log(`Simulating device ${deviceId} against ${api} every ${every / 1000}s. Ctrl+C = power cut.`);
+console.log(`Simulating device ${deviceId} against ${api} every ${every / 1000}s${critical ? ' in CRITICAL mode (low dissolved oxygen)' : ''}. Ctrl+C = power cut.`);
 let n = 0;
 tick(++n);
 setInterval(() => tick(++n), every);

@@ -3,9 +3,26 @@ const crypto = require('crypto');
 const pool = require('../db');
 const { requireAuth, requireFarm } = require('../middleware/auth');
 const { connectivitySql, lastContactSql } = require('../utils/deviceHealth');
+const { assignDevice, describeMove, AssignmentError } = require('../utils/deviceAssignment');
 
 const router = express.Router();
 router.use(requireAuth, requireFarm);
+
+// Every pond change goes through utils/deviceAssignment.js. This turns its
+// "not found" errors into the HTTP answer; anything else is a real error.
+function sendAssignmentError(res, err) {
+  if (err instanceof AssignmentError) return res.status(err.status).json({ error: err.message });
+  throw err;
+}
+
+// The sentence the app shows after a move.
+function moveMessage(move) {
+  if (!move.changed) return 'Device pond unchanged.';
+  const to = move.pond_name ? `moved to ${move.pond_name}` : 'unassigned';
+  const from = move.previous_pond_name ? ` ${move.previous_pond_name} is now offline.` : '';
+  const displaced = move.displaced_device ? ` ${move.displaced_device.device_name} was unassigned from ${move.pond_name}.` : '';
+  return `${move.device_name} ${to}.${from}${displaced}`;
+}
 
 function timeAgo(date) {
   if (!date) return 'never';
@@ -78,9 +95,11 @@ router.post('/devices', async (req, res) => {
     return res.status(400).json({ error: 'Pond does not exist in your farm' });
   }
   const deviceKey = 'dk_' + crypto.randomBytes(16).toString('hex');
+  // Registered unassigned; the pond (if any) is set below by the same code
+  // that handles every other move, so the one-device-per-pond rule holds here too.
   const [result] = await pool.query(
-    'INSERT INTO monitoring_devices (farm_id, pond_id, device_name, status, device_key) VALUES (?, ?, ?, ?, ?)',
-    [req.farmId, pondId || null, name, 'active', deviceKey]
+    'INSERT INTO monitoring_devices (farm_id, pond_id, device_name, status, device_key) VALUES (?, NULL, ?, ?, ?)',
+    [req.farmId, name, 'active', deviceKey]
   );
   // Create the one current-status row immediately. A newly registered
   // device is explicitly OFFLINE until it first contacts the API. UNIQUE
@@ -94,7 +113,18 @@ router.post('/devices', async (req, res) => {
        connectivity_status = 'offline', active_sensors_count = 0, last_seen_at = NULL`,
     [result.insertId]
   );
-  res.status(201).json({ id: String(result.insertId), name, deviceKey });
+  let move = null;
+  if (pondId) {
+    try {
+      move = await assignDevice({ deviceId: result.insertId, farmId: req.farmId, pondId });
+    } catch (err) {
+      return sendAssignmentError(res, err);
+    }
+  }
+  res.status(201).json({
+    id: String(result.insertId), name, deviceKey,
+    ...(move && move.displaced_device ? { displaced_device: move.displaced_device } : {}),
+  });
 });
 
 // PUT /api/devices/:id  { name?, pondId? }
@@ -102,21 +132,22 @@ router.post('/devices', async (req, res) => {
 // unassign the device); pondId null = unassign; pondId <id> = reassign.
 router.put('/devices/:id', async (req, res) => {
   const { name, pondId } = req.body;
-  const sets = ['device_name = COALESCE(?, device_name)'];
-  const params = [name ?? null];
-  if (pondId !== undefined) {
-    if (pondId !== null && !(await pondBelongsToFarm(pondId, req.farmId))) {
-      return res.status(400).json({ error: 'Pond does not exist in your farm' });
-    }
-    sets.push('pond_id = ?');
-    params.push(pondId);
+  if (pondId !== undefined && pondId !== null && !(await pondBelongsToFarm(pondId, req.farmId))) {
+    return res.status(400).json({ error: 'Pond does not exist in your farm' });
   }
   const [result] = await pool.query(
-    `UPDATE monitoring_devices SET ${sets.join(', ')} WHERE device_id = ? AND farm_id = ?`,
-    [...params, req.params.id, req.farmId]
+    'UPDATE monitoring_devices SET device_name = COALESCE(?, device_name) WHERE device_id = ? AND farm_id = ?',
+    [name ?? null, req.params.id, req.farmId]
   );
   if (!result.affectedRows) return res.status(404).json({ error: 'Device not found' });
-  res.json({ message: 'Device updated.' });
+
+  if (pondId === undefined) return res.json({ message: 'Device updated.' });
+  try {
+    const move = await assignDevice({ deviceId: req.params.id, farmId: req.farmId, pondId });
+    res.json({ message: 'Device updated.', ...(await describeMove(req.farmId, move)) });
+  } catch (err) {
+    sendAssignmentError(res, err);
+  }
 });
 
 // DELETE /api/devices/:id
@@ -133,41 +164,30 @@ router.post('/devices/:id/assign', async (req, res) => {
   if (!(await pondBelongsToFarm(pondId, req.farmId))) {
     return res.status(400).json({ error: 'Pond does not exist in your farm' });
   }
-  const [result] = await pool.query(
-    'UPDATE monitoring_devices SET pond_id = ? WHERE device_id = ? AND farm_id = ?',
-    [pondId, req.params.id, req.farmId]
-  );
-  if (!result.affectedRows) return res.status(404).json({ error: 'Device not found' });
-  res.json({ message: 'Device assigned.' });
+  try {
+    const move = await assignDevice({ deviceId: req.params.id, farmId: req.farmId, pondId });
+    res.json({ ...(await describeMove(req.farmId, move)), message: 'Device assigned.' });
+  } catch (err) {
+    sendAssignmentError(res, err);
+  }
 });
 
 // PUT /api/devices/:id/pond  { pond_id }
-// Remote reassignment from the app. The ESP32 picks the change up on its
-// next GET /api/devices/:id/config poll — nothing on the device is touched.
+// Remote reassignment from the app. Takes effect in the database at once: the
+// pond the device LEFT is OFFLINE and the pond it ENTERED is online in the very
+// next GET /ponds. The ESP32 learns about it on its next config poll (every
+// 10 s) and then sends a reading for the new pond straight away.
 router.put('/devices/:id/pond', async (req, res) => {
   const pondId = req.body.pond_id ?? req.body.pondId;
   if (pondId === undefined || pondId === null || pondId === '') {
     return res.status(400).json({ error: 'pond_id is required' });
   }
-
-  const [devices] = await pool.query(
-    'SELECT device_id, pond_id FROM monitoring_devices WHERE device_id = ? AND farm_id = ?',
-    [req.params.id, req.farmId]
-  );
-  if (!devices.length) return res.status(404).json({ error: 'Device not found' });
-
-  // One lookup scoped to the caller's farm: a pond id from another farm is
-  // answered exactly like a pond that doesn't exist (no id probing).
-  const [ponds] = await pool.query('SELECT pond_id, pond_name FROM ponds WHERE pond_id = ? AND farm_id = ?', [Number(pondId), req.farmId]);
-  if (!ponds.length) return res.status(404).json({ error: 'Pond not found in your farm' });
-
-  await pool.query('UPDATE monitoring_devices SET pond_id = ? WHERE device_id = ? AND farm_id = ?', [ponds[0].pond_id, devices[0].device_id, req.farmId]);
-  res.json({
-    message: 'Device pond updated.',
-    device_id: devices[0].device_id,
-    pond_id: ponds[0].pond_id,
-    pond_name: ponds[0].pond_name,
-  });
+  try {
+    const move = await assignDevice({ deviceId: req.params.id, farmId: req.farmId, pondId });
+    res.json({ ...(await describeMove(req.farmId, move)), message: moveMessage(move) });
+  } catch (err) {
+    sendAssignmentError(res, err);
+  }
 });
 
 // GET /api/devices/:id  — full detail for Device Status screen
